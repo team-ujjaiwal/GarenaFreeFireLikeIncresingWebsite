@@ -23,7 +23,7 @@ import os
 app = Flask(__name__)
 
 # SQLite database configuration
-DATABASE = 'api_keys.db'
+DATABASE = '/tmp/api_keys.db'
 
 # Initialize database
 def init_db():
