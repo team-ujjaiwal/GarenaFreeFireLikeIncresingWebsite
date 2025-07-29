@@ -21,7 +21,7 @@ import atexit
 app = Flask(__name__)
 
 # TinyDB initialization
-db = TinyDB('/temp/db.json')
+db = TinyDB('/tmp/db.json')
 keys_table = db.table('api_keys')
 
 # Initialize scheduler for daily reset
