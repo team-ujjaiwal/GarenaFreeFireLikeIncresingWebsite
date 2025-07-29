@@ -12,67 +12,41 @@ import like_count_pb2
 import uid_generator_pb2
 from google.protobuf.message import DecodeError
 from datetime import datetime, timedelta
+from tinydb import TinyDB, Query
 import secrets
 import string
 from apscheduler.schedulers.background import BackgroundScheduler
 import atexit
-import sqlite3
-from contextlib import closing
-import os
 
 app = Flask(__name__)
 
-# SQLite database configuration
-DATABASE = '/tmp/api_keys.db'
-
-# Initialize database
-def init_db():
-    with closing(sqlite3.connect(DATABASE)) as conn:
-        with conn:
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS api_keys (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    key TEXT UNIQUE NOT NULL,
-                    created_at TEXT NOT NULL,
-                    expires_at TEXT NOT NULL,
-                    total_requests INTEGER NOT NULL,
-                    remaining_requests INTEGER NOT NULL,
-                    notes TEXT,
-                    is_active BOOLEAN NOT NULL DEFAULT 1,
-                    last_reset TEXT,
-                    last_used TEXT
-                )
-            ''')
+# TinyDB initialization
+db = TinyDB('/temp/db.json')
+keys_table = db.table('api_keys')
 
 # Initialize scheduler for daily reset
 scheduler = BackgroundScheduler(daemon=True)
 scheduler.start()
 atexit.register(lambda: scheduler.shutdown())
 
-def get_db():
-    return sqlite3.connect(DATABASE)
-
 def reset_remaining_requests():
     """Reset remaining requests for all active keys to their total_requests"""
     try:
-        now = datetime.now().isoformat()
-        with get_db() as conn:
-            cursor = conn.cursor()
-            # Get active keys
-            cursor.execute('''
-                SELECT id, total_requests FROM api_keys 
-                WHERE is_active = 1 AND expires_at > ?
-            ''', (now,))
-            active_keys = cursor.fetchall()
-            
-            # Reset each active key
-            for key_id, total_requests in active_keys:
-                cursor.execute('''
-                    UPDATE api_keys 
-                    SET remaining_requests = ?, last_reset = ?
-                    WHERE id = ?
-                ''', (total_requests, now, key_id))
-            
+        now = datetime.now()
+        Key = Query()
+        active_keys = keys_table.search(
+            (Key.is_active == True) & 
+            (Key.expires_at > now.isoformat())
+        )
+        
+        for key in active_keys:
+            keys_table.update(
+                {
+                    "remaining_requests": key["total_requests"],
+                    "last_reset": now.isoformat()
+                },
+                doc_ids=[key.doc_id]
+            )
         app.logger.info(f"Successfully reset requests at {now}")
     except Exception as e:
         app.logger.error(f"Error in reset_remaining_requests: {e}")
@@ -86,9 +60,6 @@ scheduler.add_job(
     second=0,
     timezone='UTC'
 )
-
-# Initialize database on startup
-init_db()
 
 def load_tokens(server_name):
     try:
@@ -240,49 +211,38 @@ def decode_protobuf(binary):
 def authenticate_key(api_key):
     """Check if API key exists and is valid"""
     try:
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT * FROM api_keys 
-                WHERE key = ?
-            ''', (api_key,))
-            key_data = cursor.fetchone()
-            
+        Key = Query()
+        key_data = keys_table.get(Key.key == api_key)
         if not key_data:
             return None
         
-        # Convert tuple to dictionary with column names
-        columns = ['id', 'key', 'created_at', 'expires_at', 'total_requests', 
-                  'remaining_requests', 'notes', 'is_active', 'last_reset', 'last_used']
-        key_data = dict(zip(columns, key_data))
-        
         # Check expiration
         now = datetime.now()
-        expires_at = datetime.fromisoformat(key_data['expires_at'])
-        if now > expires_at:
+        if 'expires_at' in key_data and now > datetime.fromisoformat(key_data['expires_at']):
             # Mark as inactive if expired
-            with get_db() as conn:
-                conn.execute('''
-                    UPDATE api_keys 
-                    SET is_active = 0 
-                    WHERE key = ?
-                ''', (api_key,))
+            keys_table.update(
+                {"is_active": False},
+                doc_ids=[key_data.doc_id]
+            )
             return None
         
         # Check if key is active
-        if not key_data['is_active']:
+        if 'is_active' in key_data and not key_data['is_active']:
             return None
         
         # Check if we need to reset remaining requests (new day)
-        if key_data['last_reset']:
-            last_reset = datetime.fromisoformat(key_data['last_reset'])
+        if 'last_reset' in key_data:
+            last_reset = key_data['last_reset']
+            if isinstance(last_reset, str):
+                last_reset = datetime.fromisoformat(last_reset)
             if last_reset.date() < now.date():
-                with get_db() as conn:
-                    conn.execute('''
-                        UPDATE api_keys 
-                        SET remaining_requests = ?, last_reset = ?
-                        WHERE key = ?
-                    ''', (key_data['total_requests'], now.isoformat(), api_key))
+                keys_table.update(
+                    {
+                        "remaining_requests": key_data['total_requests'],
+                        "last_reset": now.isoformat()
+                    },
+                    doc_ids=[key_data.doc_id]
+                )
                 key_data['remaining_requests'] = key_data['total_requests']
         
         return key_data
@@ -293,12 +253,16 @@ def authenticate_key(api_key):
 def update_key_usage(api_key, decrement=1):
     """Decrement remaining requests count for a key only when likes are given"""
     try:
-        with get_db() as conn:
-            conn.execute('''
-                UPDATE api_keys 
-                SET remaining_requests = remaining_requests - ?, last_used = ?
-                WHERE key = ?
-            ''', (decrement, datetime.now().isoformat(), api_key))
+        Key = Query()
+        key_data = keys_table.get(Key.key == api_key)
+        if key_data:
+            keys_table.update(
+                {
+                    "remaining_requests": key_data['remaining_requests'] - decrement,
+                    "last_used": datetime.now().isoformat()
+                },
+                doc_ids=[key_data.doc_id]
+            )
     except Exception as e:
         app.logger.error(f"Error updating key usage: {e}")
 
@@ -312,39 +276,33 @@ def create_key():
         notes = data.get('notes', '')
         
         if custom_key:
-            # Check if custom key already exists
-            with get_db() as conn:
-                cursor = conn.cursor()
-                cursor.execute('SELECT 1 FROM api_keys WHERE key = ?', (custom_key,))
-                if cursor.fetchone():
-                    return jsonify({"error": "Custom key already exists"}), 400
+            Key = Query()
+            if keys_table.get(Key.key == custom_key):
+                return jsonify({"error": "Custom key already exists"}), 400
             api_key = custom_key
         else:
             alphabet = string.ascii_letters + string.digits
             api_key = ''.join(secrets.choice(alphabet) for _ in range(32))
         
-        expires_at = datetime.now() + timedelta(days=expiry_days)
-        created_at = datetime.now()
+        expires_at = (datetime.now() + timedelta(days=expiry_days)).isoformat()
         
-        with get_db() as conn:
-            conn.execute('''
-                INSERT INTO api_keys 
-                (key, created_at, expires_at, total_requests, remaining_requests, notes, is_active, last_reset)
-                VALUES (?, ?, ?, ?, ?, ?, 1, ?)
-            ''', (
-                api_key,
-                created_at.isoformat(),
-                expires_at.isoformat(),
-                total_requests,
-                total_requests,
-                notes,
-                created_at.isoformat()
-            ))
+        key_doc = {
+            "key": api_key,
+            "created_at": datetime.now().isoformat(),
+            "expires_at": expires_at,
+            "total_requests": total_requests,
+            "remaining_requests": total_requests,
+            "notes": notes,
+            "is_active": True,
+            "last_reset": datetime.now().isoformat()
+        }
+        
+        keys_table.insert(key_doc)
         
         return jsonify({
             "message": "API key created successfully",
             "key": api_key,
-            "expires_at": expires_at.isoformat(),
+            "expires_at": expires_at,
             "total_requests": total_requests,
             "notes": notes
         }), 201
@@ -364,8 +322,8 @@ def check_key():
         if not key_data:
             return jsonify({"error": "Invalid or expired API key"}), 403
         
-        # Remove internal fields before returning
-        key_data.pop('id', None)
+        # Remove TinyDB-specific fields before returning
+        key_data.pop('doc_id', None)
         
         return jsonify(key_data), 200
     except Exception as e:
@@ -385,20 +343,13 @@ def remove_key():
         if not key_data:
             return jsonify({"error": "Invalid or expired API key"}), 403
         
-        # Mark the key as inactive
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                UPDATE api_keys 
-                SET is_active = 0 
-                WHERE key = ?
-            ''', (api_key,))
-            modified = cursor.rowcount
+        # Mark the key as inactive instead of deleting it
+        keys_table.update(
+            {"is_active": False},
+            doc_ids=[key_data.doc_id]
+        )
         
-        if modified == 1:
-            return jsonify({"message": "API key deactivated successfully"}), 200
-        else:
-            return jsonify({"error": "Failed to deactivate API key"}), 400
+        return jsonify({"message": "API key deactivated successfully"}), 200
     except Exception as e:
         app.logger.error(f"Error removing API key: {e}")
         return jsonify({"error": str(e)}), 500
@@ -418,61 +369,40 @@ def update_key():
         
         data = request.get_json()
         update_fields = {}
-        update_query = []
-        update_params = []
         
         if 'total_requests' in data:
             try:
                 total_requests = int(data['total_requests'])
                 update_fields['total_requests'] = total_requests
-                update_query.append('total_requests = ?')
-                update_params.append(total_requests)
-                
                 # Also update remaining_requests if increasing total_requests
                 if total_requests > key_data.get('total_requests', 0):
-                    remaining = total_requests - (key_data.get('total_requests', 0) - key_data.get('remaining_requests', 0))
-                    update_fields['remaining_requests'] = remaining
-                    update_query.append('remaining_requests = ?')
-                    update_params.append(remaining)
+                    update_fields['remaining_requests'] = total_requests - (key_data.get('total_requests', 0) - key_data.get('remaining_requests', 0))
             except ValueError:
                 return jsonify({"error": "total_requests must be an integer"}), 400
         
         if 'expiry_days' in data:
             try:
                 expiry_days = int(data['expiry_days'])
-                new_expiry = datetime.now() + timedelta(days=expiry_days)
-                update_fields['expires_at'] = new_expiry.isoformat()
-                update_query.append('expires_at = ?')
-                update_params.append(new_expiry.isoformat())
+                new_expiry = (datetime.now() + timedelta(days=expiry_days)).isoformat()
+                update_fields['expires_at'] = new_expiry
             except ValueError:
                 return jsonify({"error": "expiry_days must be an integer"}), 400
         
         if 'is_active' in data:
-            update_fields['is_active'] = 1 if data['is_active'] else 0
-            update_query.append('is_active = ?')
-            update_params.append(update_fields['is_active'])
+            update_fields['is_active'] = bool(data['is_active'])
         
         if 'notes' in data:
             update_fields['notes'] = str(data['notes'])
-            update_query.append('notes = ?')
-            update_params.append(update_fields['notes'])
         
         if not update_fields:
             return jsonify({"error": "No valid fields to update"}), 400
         
-        # Build and execute the update query
-        update_params.append(api_key)  # for WHERE clause
-        query = f"UPDATE api_keys SET {', '.join(update_query)} WHERE key = ?"
+        keys_table.update(
+            update_fields,
+            doc_ids=[key_data.doc_id]
+        )
         
-        with get_db() as conn:
-            cursor = conn.cursor()
-            cursor.execute(query, update_params)
-            modified = cursor.rowcount
-        
-        if modified == 1:
-            return jsonify({"message": "API key updated successfully"}), 200
-        else:
-            return jsonify({"error": "No changes made to API key"}), 400
+        return jsonify({"message": "API key updated successfully"}), 200
     except Exception as e:
         app.logger.error(f"Error updating API key: {e}")
         return jsonify({"error": str(e)}), 500
